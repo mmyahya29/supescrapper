@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "supescrapper"
-version = "0.1.0"
+version = "0.2.0"
 description = "Universal web DOM scraper — fetch, query, extract, export."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "Supescrapper Contributors" }]
-keywords = ["scraper", "web-scraping", "dom", "html", "css-selector"]
+keywords = ["scraper", "web-scraping", "dom", "html", "css-selector", "element-detection", "async"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -34,7 +34,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dynamic = ["playwright>=1.40"]
-dev = ["pytest>=7.0", "pytest-cov"]
+async = ["httpx>=0.25"]
+async-dynamic = ["httpx>=0.25", "playwright>=1.40"]
+dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio>=0.21"]
 
 [project.scripts]
 supescrapper = "supescrapper.cli:main"

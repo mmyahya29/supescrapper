@@ -17,9 +17,10 @@ class ScrapedItem:
     attrs: dict[str, str] = field(default_factory=dict)
     url: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    classification: list[str] = field(default_factory=list)
 
     def __getitem__(self, key: str) -> Any:
-        if key in ("text", "html", "tag", "url"):
+        if key in ("text", "html", "tag", "url", "classification"):
             return getattr(self, key)
         if key == "attrs":
             return self.attrs
@@ -29,10 +30,28 @@ class ScrapedItem:
         d = {"tag": self.tag, "text": self.text, "url": self.url}
         d.update(self.attrs)
         d.update(self.meta)
+        if self.classification:
+            d["classification"] = self.classification
         return d
 
     def to_json(self, indent: int | None = None) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ScrapedItem":
+        known_fields = {"tag", "text", "html", "url", "classification", "attrs"}
+        meta = {k: v for k, v in data.items() if k not in known_fields}
+        return cls(
+            tag=data.get("tag", ""),
+            text=data.get("text", ""),
+            html=data.get("html", ""),
+            attrs=data.get("attrs", {}),
+            url=data.get("url", ""),
+            meta=meta,
+            classification=data.get("classification", []),
+        )
+
+
 
 
 class ScrapedResultSet:

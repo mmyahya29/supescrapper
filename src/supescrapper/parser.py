@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag, NavigableString
 
@@ -23,10 +24,14 @@ def parse(html: str, parser: str = _PARSER) -> BeautifulSoup:
 
 def is_spa(html: str) -> bool:
     """Heuristic: does this HTML look like an un-rendered JS SPA shell?"""
+    # Empty or near-empty responses need dynamic rendering
+    if len(html.strip()) < 50:
+        return True
+
     soup = BeautifulSoup(html, "lxml")
     body = soup.find("body")
     if body is None:
-        return False
+        return True
 
     # 1. Check for empty root containers
     for root_id in _SPA_ROOT_IDS:
@@ -72,6 +77,8 @@ def _tag_url(tag: Tag, base_url: str = "") -> str:
     for key in ("href", "src", "data-src", "data-href"):
         val = tag.get(key)
         if val and isinstance(val, str):
+            if base_url and not val.startswith(("http://", "https://", "mailto:", "tel:", "#", "javascript:")):
+                return urljoin(base_url, val)
             return val
     return ""
 
@@ -86,10 +93,40 @@ def select(root: BeautifulSoup | Tag, selector: str) -> list[Tag]:
 
 def select_xpath(root: BeautifulSoup | Tag, xpath_expr: str) -> list[Tag]:
     """XPath expression → list of Tag (via lxml)."""
-    if hasattr(root, "xpath"):
-        found = root.xpath(xpath_expr)
+    from lxml import etree
+
+    if isinstance(root, BeautifulSoup):
+        html_str = str(root)
+    elif isinstance(root, Tag):
+        html_str = str(root)
     else:
-        raise SelectorError("XPath requires lxml parser.")
+        raise SelectorError("XPath requires a BeautifulSoup or Tag object.")
+
+    try:
+        lxml_tree = etree.HTML(html_str)
+    except Exception as exc:
+        raise SelectorError(f"Failed to parse HTML for XPath: {exc}") from exc
+
+    found = lxml_tree.xpath(xpath_expr)
+    if not found:
+        raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
+
+    soup = parse(html_str)
+    result: list[Tag] = []
+    for node in found:
+        if isinstance(node, str):
+            continue
+        tag_name = node.tag if hasattr(node, "tag") else None
+        if tag_name is None:
+            continue
+        found_tags = soup.find_all(tag_name)
+        for t in found_tags:
+            result.append(t)
+            break
+
+    if not result:
+        raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
+    return result
     result = [n for n in found if isinstance(n, Tag)]
     if not result:
         raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
@@ -99,8 +136,9 @@ def select_xpath(root: BeautifulSoup | Tag, xpath_expr: str) -> list[Tag]:
 def select_by_regex(root: BeautifulSoup | Tag, pattern: str, tag: str = "*") -> list[Tag]:
     """Find tags whose text matches *pattern*."""
     compiled = re.compile(pattern, re.IGNORECASE)
+    search_tag = True if tag == "*" else tag
     return [
-        t for t in root.find_all(tag)
+        t for t in root.find_all(search_tag)
         if isinstance(t, Tag) and compiled.search(_tag_text(t))
     ]
 
@@ -129,9 +167,12 @@ def extract_fields(tag: Tag, **field_selectors: str) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     for field_name, spec in field_selectors.items():
-        parts = spec.rsplit(".", 1)
-        css_selector = parts[0]
-        prop = parts[1] if len(parts) == 2 else "text"
+        if "@" in spec:
+            css_selector, prop = spec.rsplit("@", 1)
+        else:
+            parts = spec.rsplit(".", 1)
+            css_selector = parts[0]
+            prop = parts[1] if len(parts) == 2 else "text"
 
         child = tag.select_one(css_selector)
         if child is None:

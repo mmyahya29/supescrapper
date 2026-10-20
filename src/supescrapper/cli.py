@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .scraper import Scraper
+from .classifier import get_classifier, INTERACTIVE_TYPES
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -27,7 +28,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extract", "-e", nargs="*", metavar="KEY=SPEC", help='Extract named fields, e.g. title="h2.text" price="span.price.text"')
     p.add_argument("--dynamic", "-d", action="store_true", help="Force Playwright (skip auto-detection)")
     p.add_argument("--static", action="store_true", help="Force static fetch only (never use Playwright)")
-    p.add_argument("--wait-until", default="networkidle", help="Playwright wait condition (default: networkidle)")
+    p.add_argument("--wait-until", default="domcontentloaded", help="Playwright wait condition (default: domcontentloaded)")
     p.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
     p.add_argument("--retries", type=int, default=3, help="Number of retries (default: 3)")
     p.add_argument("--user-agent", help="Custom user agent string")
@@ -43,6 +44,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extract-links", action="store_true", help="Extract all links from page")
     p.add_argument("--extract-images", action="store_true", help="Extract all images from page")
     p.add_argument("--extract-table", nargs="?", const="table", help="Extract HTML table (optional selector)")
+
+    # --- Element detection ---
+    detect = p.add_argument_group("element detection")
+    detect.add_argument("--find", metavar="TYPE", help="Find all elements of a specific type (e.g., button, search_input, login_form)")
+    detect.add_argument("--find-interactive", action="store_true", help="Find all interactive elements (buttons, inputs, links, etc.)")
+    detect.add_argument("--classify", action="store_true", help="Classify all query results with element types")
+    detect.add_argument("--list-types", action="store_true", help="List all supported element types and exit")
+
     return p
 
 
@@ -50,6 +59,14 @@ def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
     console = Console()
+
+    if args.list_types:
+        classifier = get_classifier()
+        console.print("[bold]Supported element types:[/bold]")
+        for name in sorted(set(classifier.registered_types)):
+            console.print(f"  [cyan]{name}[/cyan]")
+        console.print(f"\n[dim]Interactive types: {', '.join(sorted(INTERACTIVE_TYPES))}[/dim]")
+        return
 
     if not args.url and not args.html_file:
         parser.print_help()
@@ -80,6 +97,16 @@ def main(argv: list[str] | None = None) -> None:
             fetch_kwargs["dynamic"] = "auto"
         console.print(f"[bold cyan]Fetching:[/bold cyan] {args.url}")
         scraper.fetch(args.url, **fetch_kwargs)
+
+    # --- Element detection shortcuts ---
+    if args.find:
+        results = scraper.find_elements(args.find)
+        _output(results, args, console)
+        return
+    if args.find_interactive:
+        results = scraper.find_interactive()
+        _output(results, args, console)
+        return
 
     # --- Extract shortcuts ---
     if args.extract_links:
@@ -121,6 +148,10 @@ def main(argv: list[str] | None = None) -> None:
         scraper.where_tag(args.where_tag)
     if args.limit:
         scraper.limit(args.limit)
+
+    # --- Classify ---
+    if args.classify:
+        scraper.classify()
 
     # --- Extract named fields ---
     field_selectors: dict[str, str] = {}

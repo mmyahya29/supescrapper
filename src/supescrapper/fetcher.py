@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,6 +14,17 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL by adding https:// if no scheme is present."""
+    url = url.strip()
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = "https://" + url
+    return url
 
 
 def _build_session(
@@ -44,6 +56,7 @@ def fetch_static(
     cookies: dict[str, str] | None = None,
 ) -> str:
     """Fetch *url* with requests and return raw HTML."""
+    url = _normalize_url(url)
     session = _build_session(timeout=timeout, retries=retries, user_agent=user_agent, proxies=proxies)
     if headers:
         session.headers.update(headers)
@@ -59,11 +72,12 @@ def fetch_dynamic(
     url: str,
     *,
     timeout: int = 30_000,
-    wait_until: str = "networkidle",
+    wait_until: str = "domcontentloaded",
     user_agent: str = _USER_AGENT,
     viewport: dict[str, int] | None = None,
 ) -> str:
     """Fetch *url* with Playwright (headless Chromium) and return rendered HTML."""
+    url = _normalize_url(url)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:

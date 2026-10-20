@@ -5,12 +5,14 @@ Universal web DOM scraper for Python. Fetch any page, query with CSS/XPath, full
 ## Features
 
 - **Auto-detection** — static pages use `requests`, JS-rendered SPAs automatically switch to Playwright
+- **Element classification** — detect buttons, inputs, forms, search bars, login forms, and 25+ element types
 - **Fluent API** — chain `.fetch().query().where().extract().export()` in one line
 - **CSS / XPath / Regex selectors** — query the DOM however you want
 - **Full-text search** — find any word anywhere on the page
 - **Filter engine** — chain `.where_text()`, `.where_attr()`, `.where_tag()` filters
 - **Named field extraction** — pull structured data with `extract(title="h2.text", price="span.price")`
 - **Export** — JSON, CSV, SQLite with one call
+- **Async support** — `AsyncScraper` for async/await workflows
 - **CLI** — full command-line interface, no code needed
 
 ## Install
@@ -24,6 +26,12 @@ For JavaScript-rendered pages (React, Vue, Next.js, etc.):
 ```bash
 pip install supescrapper[dynamic]
 playwright install chromium
+```
+
+For async support:
+
+```bash
+pip install supescrapper[async]
 ```
 
 ## Quick Start
@@ -47,6 +55,9 @@ from supescrapper import Scraper
 
 # Fetch any URL — auto-detects if it needs Playwright
 results = Scraper().fetch("https://example.com").query("h1").extract()
+
+# URLs without scheme work too
+results = Scraper().fetch("example.com").query("h1").extract()
 
 # Force static only (requests, no browser)
 results = Scraper().fetch("https://example.com", dynamic=False).query("h1").extract()
@@ -86,6 +97,34 @@ results = Scraper().fetch("https://example.com").search("price").extract()
 
 # Case-sensitive search
 results = Scraper().fetch("https://example.com").search("JavaScript", case_sensitive=True).extract()
+```
+
+### Element Detection
+
+```python
+from supescrapper import Scraper
+
+scraper = Scraper()
+scraper.fetch("https://example.com")
+
+# Find all buttons
+buttons = scraper.find_elements("button")
+
+# Find all search inputs
+search_fields = scraper.find_elements("search_input")
+
+# Find all interactive elements (buttons, inputs, links, etc.)
+interactive = scraper.find_interactive()
+
+# Find login forms
+login_forms = scraper.find_elements("login_form")
+
+# Classify all elements on a page
+results = scraper.query("form").classify()
+
+# Check classifications
+for item in results:
+    print(item.classification)  # e.g. ['form', 'login_form']
 ```
 
 ### Filtering Results
@@ -235,8 +274,24 @@ results.export("json", "links.json")
 # Export to CSV
 results.export("csv", "links.csv")
 
-# Export to SQLite
-results.export("sqlite", "links.db", table="links")
+# Export to SQLite (with deduplication)
+results.export("sqlite", "links.db", table="links", unique_keys=["url"])
+```
+
+### Async Scraper
+
+```python
+import asyncio
+from supescrapper import AsyncScraper
+
+async def main():
+    async with AsyncScraper() as scraper:
+        await scraper.fetch("https://example.com")
+        results = scraper.query("h1").extract()
+        for item in results:
+            print(item.text)
+
+asyncio.run(main())
 ```
 
 ### Proxy and Headers
@@ -285,6 +340,28 @@ supescrapper https://example.com --extract-links --table
 supescrapper https://example.com --search "price" --table
 ```
 
+### Element Detection
+
+```bash
+# Find all buttons
+supescrapper https://example.com --find button
+
+# Find all search inputs
+supescrapper https://example.com --find search_input
+
+# Find all interactive elements
+supescrapper https://example.com --find-interactive
+
+# Find login forms
+supescrapper https://example.com --find login_form
+
+# Classify all elements
+supescrapper https://example.com --select "form" --classify
+
+# List all supported element types
+supescrapper --list-types
+```
+
 ### Filtering
 
 ```bash
@@ -331,6 +408,9 @@ supescrapper https://myapp.com --select ".card" --dynamic --table
 
 # Force static only
 supescrapper https://example.com --select "h1" --static --table
+
+# Change wait condition
+supescrapper https://myapp.com --select ".card" --dynamic --wait-until networkidle --table
 ```
 
 ### Full CLI Reference
@@ -344,6 +424,7 @@ positional arguments:
   url                        URL to scrape
 
 options:
+  --html-file, -f            Local HTML file to parse
   --select, -s               CSS selector
   --select-xpath             XPath selector
   --select-regex             Regex to match element text
@@ -351,6 +432,11 @@ options:
   --extract, -e              Named fields, e.g. title="h2.text"
   --dynamic, -d              Force Playwright
   --static                   Force static requests only
+  --wait-until               Playwright wait condition (default: domcontentloaded)
+  --timeout                  Request timeout in seconds (default: 30)
+  --retries                  Number of retries (default: 3)
+  --user-agent               Custom user agent string
+  --proxy                    HTTP proxy URL
   --where-text OP VALUE      Filter: "contains|equals|matches" value
   --where-attr ATTR OP VALUE Filter by attribute
   --where-tag TAG            Filter by tag name
@@ -362,7 +448,25 @@ options:
   --extract-links            Extract all links
   --extract-images           Extract all images
   --extract-table            Extract HTML table
+
+element detection:
+  --find TYPE                Find all elements of a specific type
+  --find-interactive         Find all interactive elements
+  --classify                 Classify all query results
+  --list-types               List all supported element types
 ```
+
+### Supported Element Types
+
+The classifier recognizes 25+ element types:
+
+- **Buttons**: button, submit_button, toggle_button, icon_button, hamburger_menu
+- **Inputs**: text_input, email_input, password_input, search_input, number_input, date_input, tel_input, url_input, file_input, range_slider
+- **Form elements**: textarea, select_dropdown, checkbox, radio_button, form
+- **Layout**: header, footer, sidebar, card, modal, accordion, carousel
+- **Navigation**: nav, breadcrumb, tabs, pagination
+- **Media**: image, avatar, logo, icon, video
+- **Interactive**: login_form, signup_form, social_auth_button, add_to_cart, price_display, search_bar, share_button
 
 ## License
 

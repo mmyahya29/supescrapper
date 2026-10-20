@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .classifier import ClassificationRule, ElementClassifier, get_classifier
 from .exceptions import SelectorError
 from .fetcher import fetch_static, fetch_dynamic
 from .parser import (
@@ -33,6 +34,7 @@ class Scraper:
         self._results: ScrapedResultSet | None = None
         self._url: str = ""
         self._query_chain: QueryChain | None = None
+        self._classifier: ElementClassifier = get_classifier()
 
     def fetch(
         self,
@@ -45,7 +47,7 @@ class Scraper:
         proxies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
-        wait_until: str = "networkidle",
+        wait_until: str = "domcontentloaded",
         viewport: dict[str, int] | None = None,
     ) -> "Scraper":
         """
@@ -83,7 +85,7 @@ class Scraper:
     def _fetch_static(self, url: str, **kwargs: Any) -> str:
         return fetch_static(url, **kwargs)
 
-    def _fetch_dynamic(self, url: str, *, timeout: int = 30, user_agent: str | None = None, viewport: dict[str, int] | None = None, wait_until: str = "networkidle", **_extra: Any) -> str:
+    def _fetch_dynamic(self, url: str, *, timeout: int = 30, user_agent: str | None = None, viewport: dict[str, int] | None = None, wait_until: str = "domcontentloaded", **_extra: Any) -> str:
         dyn_kwargs: dict[str, Any] = {"timeout": timeout * 1000, "wait_until": wait_until}
         if user_agent:
             dyn_kwargs["user_agent"] = user_agent
@@ -144,6 +146,12 @@ class Scraper:
         self._query_chain.where_tag(tag_name)
         return self
 
+    def where_url(self, op: str, value: str) -> "Scraper":
+        if self._query_chain is None:
+            raise SelectorError("No active query — call .query() first.")
+        self._query_chain.where_url(op, value)
+        return self
+
     def where(self, predicate) -> "Scraper":
         if self._query_chain is None:
             raise SelectorError("No active query — call .query() first.")
@@ -178,9 +186,10 @@ class Scraper:
                 continue
             fields = extract_fields(tag, **field_selectors)
             merged_attrs = dict(src_item.attrs)
+            item_text = fields.pop("text", src_item.text) if "text" in field_selectors else src_item.text
             items.append(ScrapedItem(
                 tag=src_item.tag,
-                text=fields.pop("text", src_item.text) if "text" not in field_selectors else src_item.text,
+                text=item_text,
                 html=src_item.html,
                 attrs=merged_attrs,
                 url=src_item.url,
@@ -214,6 +223,75 @@ class Scraper:
         out = ScrapedResultSet(items)
         out.source_url = self._url
         return out
+
+    def classify(self) -> "Scraper":
+        """Tag all current results with their detected element types."""
+        self._finalize()
+        if self._soup is None or self._results is None:
+            raise SelectorError("Nothing to classify — call fetch() and query() first.")
+        soup = self._soup
+        classified_items: list[ScrapedItem] = []
+        for item in self._results:
+            inner = parse(item.html)
+            tag = inner.find()
+            if tag is None:
+                classified_items.append(item)
+                continue
+            types = self._classifier.classify(tag, soup)
+            new_item = ScrapedItem(
+                tag=item.tag,
+                text=item.text,
+                html=item.html,
+                attrs=dict(item.attrs),
+                url=item.url,
+                meta=dict(item.meta),
+                classification=types,
+            )
+            classified_items.append(new_item)
+        out = ScrapedResultSet(classified_items)
+        out.source_url = self._results.source_url
+        self._results = out
+        self._query_chain = QueryChain(self._results)
+        return self
+
+    def find_elements(self, element_type: str) -> ScrapedResultSet:
+        """Find all elements matching a specific type (e.g., 'button', 'search_input')."""
+        if self._soup is None:
+            raise SelectorError("Nothing to find — call fetch() or from_html() first.")
+        tags = self._classifier.find(element_type, self._soup)
+        items = tags_to_items(tags, base_url=self._url)
+        for item in items:
+            inner = parse(item.html)
+            tag = inner.find()
+            if tag is not None:
+                item.classification = self._classifier.classify(tag, self._soup)
+        out = ScrapedResultSet(items)
+        out.source_url = self._url
+        self._results = out
+        self._query_chain = QueryChain(self._results)
+        return self
+
+    def find_interactive(self) -> ScrapedResultSet:
+        """Find all interactive elements (buttons, inputs, links, selects, etc.)."""
+        if self._soup is None:
+            raise SelectorError("Nothing to find — call fetch() or from_html() first.")
+        tags = self._classifier.find_interactive(self._soup)
+        items = tags_to_items(tags, base_url=self._url)
+        for item in items:
+            inner = parse(item.html)
+            tag = inner.find()
+            if tag is not None:
+                item.classification = self._classifier.classify(tag, self._soup)
+        out = ScrapedResultSet(items)
+        out.source_url = self._url
+        self._results = out
+        self._query_chain = QueryChain(self._results)
+        return self
+
+    def register_classifier(self, rule: ClassificationRule) -> "Scraper":
+        """Add a custom classification rule."""
+        self._classifier.register(rule)
+        return self
 
     def _finalize(self) -> None:
         if self._query_chain is not None and self._results is not None:

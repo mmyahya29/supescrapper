@@ -52,7 +52,7 @@ def export_csv(results, dest: str | Path, *, delimiter: str = ",") -> Path:
     return p
 
 
-def export_sqlite(results, dest: str | Path, *, table: str = "results") -> Path:
+def export_sqlite(results, dest: str | Path, *, table: str = "results", unique_keys: list[str] | None = None) -> Path:
     from .models import ScrapedResultSet
     p = _resolve_path(dest)
     rows = results.to_list() if isinstance(results, ScrapedResultSet) else [r.to_dict() for r in results]
@@ -72,8 +72,22 @@ def export_sqlite(results, dest: str | Path, *, table: str = "results") -> Path:
         cur = conn.cursor()
         col_defs = ", ".join(f'"{k}" TEXT' for k in all_keys)
         cur.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
-        placeholders = ", ".join("?" for _ in all_keys)
-        insert_sql = f'INSERT INTO "{table}" ({", ".join(f"{k!r}" for k in all_keys)}) VALUES ({placeholders})'
+
+        if unique_keys:
+            valid_unique = [k for k in unique_keys if k in all_keys]
+            if valid_unique:
+                cols_for_idx = ", ".join(f'"{k}"' for k in valid_unique)
+                idx_name = f"uq_{table}_{'_'.join(valid_unique)}"
+                cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" ON "{table}" ({cols_for_idx})')
+                placeholders = ", ".join("?" for _ in all_keys)
+                insert_sql = f'INSERT OR REPLACE INTO "{table}" ({", ".join(f"{k!r}" for k in all_keys)}) VALUES ({placeholders})'
+            else:
+                placeholders = ", ".join("?" for _ in all_keys)
+                insert_sql = f'INSERT INTO "{table}" ({", ".join(f"{k!r}" for k in all_keys)}) VALUES ({placeholders})'
+        else:
+            placeholders = ", ".join("?" for _ in all_keys)
+            insert_sql = f'INSERT INTO "{table}" ({", ".join(f"{k!r}" for k in all_keys)}) VALUES ({placeholders})'
+
         for row in rows:
             values = [row.get(k, "") for k in all_keys]
             cur.execute(insert_sql, values)

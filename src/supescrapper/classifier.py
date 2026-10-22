@@ -665,7 +665,7 @@ SOCIAL_DOMAINS = [
 
 _SOCIAL_PATTERN = "|".join(re.escape(d) for d in SOCIAL_DOMAINS)
 
-_BUILTIN_RULES: list[ClassificationRule] = [
+_BUILTIN_RULES: tuple[ClassificationRule, ...] = tuple([
     ClassificationRule(
         name="submit_button",
         composite_check=_composite_submit_button,
@@ -948,13 +948,10 @@ _BUILTIN_RULES: list[ClassificationRule] = [
         priority=25,
         description="Icon elements (SVG, Font Awesome, Glyphicons)",
     ),
-]
-
-_default_classifier: ElementClassifier | None = None
+])
 
 
 def get_classifier() -> ElementClassifier:
-    global _default_classifier
-    if _default_classifier is None:
-        _default_classifier = ElementClassifier()
-    return _default_classifier
+    """Return a fresh classifier so per-instance rule registration cannot
+    leak into other Scraper/AsyncScraper instances."""
+    return ElementClassifier()

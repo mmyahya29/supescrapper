@@ -41,6 +41,14 @@ class QueryChain:
         self._results = results
         self._filters: list[FilterFn] = []
 
+    @property
+    def filters(self) -> list[FilterFn]:
+        """Read-only view of the registered filter functions."""
+        return list(self._filters)
+
+    def matches(self, item: ScrapedItem) -> bool:
+        return all(fn(item) for fn in self._filters)
+
     def _add(self, fn: FilterFn) -> "QueryChain":
         self._filters.append(fn)
         return self

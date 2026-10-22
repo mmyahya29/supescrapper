@@ -10,7 +10,6 @@ from supescrapper.classifier import (
     AttrMatcher,
     get_classifier,
     INTERACTIVE_TYPES,
-    _BUILTIN_RULES,
 )
 
 
@@ -594,10 +593,17 @@ class TestCustomRules:
 
 
 class TestGetClassifier:
-    def test_singleton(self):
+    def test_returns_fresh_instances(self):
         c1 = get_classifier()
         c2 = get_classifier()
-        assert c1 is c2
+        assert c1 is not c2
+
+    def test_registration_does_not_leak(self):
+        c1 = get_classifier()
+        c1.register(ClassificationRule(name="custom_only"))
+        c2 = get_classifier()
+        assert "custom_only" in c1.registered_types
+        assert "custom_only" not in c2.registered_types
 
     def test_has_builtin_rules(self):
         c = get_classifier()

@@ -1,29 +1,54 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4 import BeautifulSoup, Tag
 
 from .models import ScrapedItem
 from .exceptions import SelectorError
 
 _PARSER = "lxml"
 
-_SPA_ROOT_IDS = ("root", "app", "__next", "__nuxt", "__svelte", "__qwik", "svelte", "vue-app", "react-root")
-_SPA_BODY_MARKERS = (
-    "react", "vue", "angular", "svelte", "next", "nuxt",
-    "vite", "webpack", "__remix", "ember", "solidjs",
+_SPA_ROOT_IDS = (
+    "root", "app", "__next", "__nuxt", "__svelte", "__qwik",
+    "svelte", "vue-app", "react-root", "nuxt-root", "app-shell",
 )
+_SPA_ROOT_TAGS = ("app-root", "nuxt-root", "outlet")
+_CONTENT_TAGS = ("img", "picture", "video", "source", "canvas", "a", "iframe")
 
 
-def parse(html: str, parser: str = _PARSER) -> BeautifulSoup:
+def _has_content_media(body: Tag) -> bool:
+    """True if the body contains any non-text content (media/links/embeds)."""
+    if body.find(_CONTENT_TAGS) is not None:
+        return True
+    return bool(body.select("a[href]"))
+_KNOWN_FIELD_PROPS = ("text", "html", "href", "src")
+
+
+def is_xml(content: str) -> bool:
+    """True if content looks like XML / RSS / Atom rather than HTML."""
+    if not content:
+        return False
+    s = content.lstrip()
+    if s.startswith("<?xml"):
+        return True
+    prefix = s[:500].lower()
+    return bool(re.search(r"<(?:rss|feed|rdf:rdf|channel)[\s>]", prefix))
+
+
+def parse(html: str, parser: str | None = None) -> BeautifulSoup:
+    if parser is None:
+        parser = "xml" if is_xml(html) else _PARSER
     return BeautifulSoup(html, parser)
 
 
 def is_spa(html: str) -> bool:
     """Heuristic: does this HTML look like an un-rendered JS SPA shell?"""
+    # XML, RSS, and Atom feeds are structured data, not SPAs
+    if is_xml(html):
+        return False
+
     # Empty or near-empty responses need dynamic rendering
     if len(html.strip()) < 50:
         return True
@@ -32,34 +57,53 @@ def is_spa(html: str) -> bool:
     body = soup.find("body")
     if body is None:
         return True
+    text_content = body.get_text(strip=True)
 
-    # 1. Check for empty root containers
+    # 1. Empty (or spinner-only) root containers used by SPA frameworks.
+    #    Whitespace/comment children don't count as rendered content.
     for root_id in _SPA_ROOT_IDS:
         root_el = soup.find(id=root_id)
-        if root_el is not None and len(root_el.get_text(strip=True)) == 0 and len(list(root_el.children)) == 0:
+        if root_el is None or root_el.get_text(strip=True):
+            continue
+        if len(root_el.find_all(True)) <= 2:
+            return True
+    for root_tag in _SPA_ROOT_TAGS:
+        root_el = soup.find(root_tag)
+        if root_el is None or root_el.get_text(strip=True):
+            continue
+        if len(root_el.find_all(True)) <= 2:
             return True
 
-    # 2. Very little visible text relative to total HTML size
-    text_content = body.get_text(strip=True)
-    if len(html) > 500 and len(text_content) < 100:
+    # 2. React shell marker on a content-less body
+    if soup.find(attrs={"data-reactroot": True}) is not None and len(text_content) < 100:
         return True
 
-    # 3. Few real content elements AND almost no text (avoid false positives on simple pages)
+    # 3. Framework data blobs only matter when the page has no visible text
+    #    (fully SSG/SSR pages carry the same blobs plus real content).
+    if len(text_content) < 300:
+        if soup.find("script", id="__NEXT_DATA__") is not None:
+            return True
+        if soup.find("script", id="__NUXT_DATA__") is not None:
+            return True
+        for s in soup.find_all("script"):
+            if not s.get("src") and "window.__NUXT__" in (s.string or ""):
+                return True
+
+    # 4. Very little visible text and no non-text content (links/media) → shell
+    if len(html) > 500 and len(text_content) < 100 and not _has_content_media(body):
+        return True
+
+    # 5. Few real content elements AND almost no text (avoid false positives on simple pages)
     real_tags = [t for t in body.find_all(True) if t.name not in ("script", "style", "meta", "link", "noscript")]
-    if len(html) > 500 and len(real_tags) < 5 and len(text_content) < 100:
+    if len(html) > 500 and len(real_tags) < 5 and len(text_content) < 100 and not _has_content_media(body):
         return True
 
-    # 4. SPA framework markers in scripts or comments
-    html_lower = html.lower()
-    for marker in _SPA_BODY_MARKERS:
-        if f'"{marker}"' in html_lower or f"'{marker}'" in html_lower:
+    # 6. Build-tool bundle scripts (Vite /assets/, Webpack content-hash filenames)
+    for s in soup.find_all("script", src=True):
+        src = s.get("src", "") or ""
+        if re.search(r"/assets/.+\.(?:js|mjs)$", src):
             return True
-
-    # 5. Module scripts with hashed filenames (Vite, Webpack, etc.)
-    scripts = soup.find_all("script", {"type": "module"})
-    for s in scripts:
-        src = s.get("src", "")
-        if re.search(r"/assets/.+\.(js|mjs)$", src):
+        if re.search(r"\.[A-Za-z0-9_-]{8,}\.(?:js|mjs)$", src):
             return True
 
     return False
@@ -92,12 +136,15 @@ def select(root: BeautifulSoup | Tag, selector: str) -> list[Tag]:
 
 
 def select_xpath(root: BeautifulSoup | Tag, xpath_expr: str) -> list[Tag]:
-    """XPath expression → list of Tag (via lxml)."""
+    """XPath expression → list of Tag (via lxml).
+
+    Each matched lxml node is serialized back to an HTML fragment and
+    parsed into an independent BeautifulSoup Tag, so attributes, text and
+    nesting of the *actual* matched elements are preserved.
+    """
     from lxml import etree
 
-    if isinstance(root, BeautifulSoup):
-        html_str = str(root)
-    elif isinstance(root, Tag):
+    if isinstance(root, (BeautifulSoup, Tag)):
         html_str = str(root)
     else:
         raise SelectorError("XPath requires a BeautifulSoup or Tag object.")
@@ -107,27 +154,33 @@ def select_xpath(root: BeautifulSoup | Tag, xpath_expr: str) -> list[Tag]:
     except Exception as exc:
         raise SelectorError(f"Failed to parse HTML for XPath: {exc}") from exc
 
-    found = lxml_tree.xpath(xpath_expr)
+    if lxml_tree is None:
+        raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
+
+    try:
+        found = lxml_tree.xpath(xpath_expr)
+    except Exception as exc:
+        raise SelectorError(f"Invalid XPath '{xpath_expr}': {exc}") from exc
+
     if not found:
         raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
 
-    soup = parse(html_str)
     result: list[Tag] = []
     for node in found:
         if isinstance(node, str):
             continue
-        tag_name = node.tag if hasattr(node, "tag") else None
-        if tag_name is None:
+        if not hasattr(node, "tag"):
             continue
-        found_tags = soup.find_all(tag_name)
-        for t in found_tags:
-            result.append(t)
-            break
+        try:
+            frag = etree.tostring(node, method="html", encoding="unicode")
+        except Exception:
+            continue
+        frag_soup = parse(frag)
+        # lxml wraps non-root fragments in <html><body>; unwrap to the real node.
+        tag = frag_soup.find(node.tag)
+        if isinstance(tag, Tag):
+            result.append(tag)
 
-    if not result:
-        raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
-    return result
-    result = [n for n in found if isinstance(n, Tag)]
     if not result:
         raise SelectorError(f"XPath '{xpath_expr}' matched nothing.")
     return result
@@ -157,24 +210,46 @@ def tags_to_items(tags: list[Tag], base_url: str = "") -> list[ScrapedItem]:
     return items
 
 
+def _split_field_spec(spec: str) -> tuple[str, str]:
+    """Split a field spec into (css_selector, property).
+
+    Grammar:
+      "selector@attr"                   -> attribute *attr* (any name)
+      "selector.text|.html|.href|.src"  -> explicit known property
+      "selector"                        -> whole spec is CSS; property = "text"
+
+    Any other dot means the whole spec is a CSS selector (so class selectors
+    like "span.price" are not mistaken for a property lookup).
+    """
+    if "@" in spec:
+        css_selector, attr = spec.rsplit("@", 1)
+        return css_selector, attr
+    if "." in spec:
+        css_selector, tail = spec.rsplit(".", 1)
+        if tail in _KNOWN_FIELD_PROPS and css_selector:
+            return css_selector, tail
+    return spec, "text"
+
+
 def extract_fields(tag: Tag, **field_selectors: str) -> dict[str, str]:
     """
     Extract named fields from a parent tag.
 
     Usage:
         extract_fields(card, title="h2.text", price="span.price.text", link="a@href")
-    Format: "selector.property" or just "selector" (defaults to .text)
+        extract_fields(card, price="span.price")   # defaults to .text
+    Format: "selector.property" (property in text/html/href/src),
+            "selector@attribute", or just "selector" (defaults to .text).
     """
     result: dict[str, str] = {}
     for field_name, spec in field_selectors.items():
-        if "@" in spec:
-            css_selector, prop = spec.rsplit("@", 1)
-        else:
-            parts = spec.rsplit(".", 1)
-            css_selector = parts[0]
-            prop = parts[1] if len(parts) == 2 else "text"
+        css_selector, prop = _split_field_spec(spec)
 
-        child = tag.select_one(css_selector)
+        try:
+            child = tag.select_one(css_selector)
+        except Exception:
+            result[field_name] = ""
+            continue
         if child is None:
             result[field_name] = ""
             continue

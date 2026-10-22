@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -46,6 +45,18 @@ class TestScrapedItem:
     def test_to_dict_empty_classification_omitted(self):
         item = ScrapedItem(tag="div", text="Hello")
         assert "classification" not in item.to_dict()
+
+    def test_to_dict_attrs_cannot_overwrite_core_fields(self):
+        item = ScrapedItem(tag="div", text="real", url="/real",
+                           attrs={"tag": "spoofed", "text": "spoofed", "url": "spoofed"})
+        d = item.to_dict()
+        assert d["tag"] == "div"
+        assert d["text"] == "real"
+        assert d["url"] == "/real"
+
+    def test_to_dict_meta_cannot_overwrite_core_fields(self):
+        item = ScrapedItem(tag="p", text="real", meta={"tag": "spoof"})
+        assert item.to_dict()["tag"] == "p"
 
     def test_to_json(self):
         item = ScrapedItem(tag="p", text="Hello")
@@ -153,6 +164,23 @@ class TestExportSQLite:
         out = tmp_path / "empty.db"
         result = rs.export("sqlite", out)
         assert result == out
+
+    def test_hostile_attribute_name_does_not_crash(self, tmp_path):
+        evil = ScrapedItem(tag="div", text="x",
+                           attrs={'weird"name': "v", "semi;colon": "w"})
+        rs = ScrapedResultSet([evil])
+        out = tmp_path / "hostile.db"
+        rs.export("sqlite", out)
+        conn = sqlite3.connect(str(out))
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(results)").fetchall()]
+        conn.close()
+        assert 'weird"name' in cols
+
+    def test_invalid_table_name_raises(self, tmp_path):
+        from supescrapper.exceptions import ExportError
+        rs = ScrapedResultSet([ScrapedItem(tag="p", text="A")])
+        with pytest.raises(ExportError, match="Invalid table name"):
+            rs.export("sqlite", tmp_path / "x.db", table='bad); DROP TABLE x; --')
 
 
 class TestInvalidFormat:

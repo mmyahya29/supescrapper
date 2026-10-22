@@ -1,0 +1,17 @@
+{
+  "_comment": "Bloomberg Markets RSS feed schema. Fields map to the XML elements found in each <item>.",
+  "name": "bloomberg",
+  "description": "Bloomberg Markets RSS 2.0 feed (dc:creator author, guid id, RFC-822 pubDate)",
+  "item": "item",
+  "system_fields": ["source_url", "scraped_at", "time_scraped"],
+  "strict": false,
+  "fallback_single": false,
+  "fields": {
+    "article_id": ["guid", "guid@isPermaLink"],
+    "title": ["title"],
+    "description": ["description"],
+    "url": ["link"],
+    "author_name": ["dc:creator"],
+    "date_published": ["pubDate"]
+  }
+}

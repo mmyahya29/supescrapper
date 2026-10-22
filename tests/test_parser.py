@@ -45,6 +45,35 @@ class TestIsSpa:
     def test_normal_page_not_spa(self):
         assert not is_spa("<html><body><h1>Welcome</h1><p>This is a normal page with lots of content.</p></body></html>")
 
+    # --- false-positive regression tests ---
+    def test_article_about_react_not_spa(self):
+        html = ('<html><body><article>' + "x" * 600 +
+                '<p>React is a UI library</p><script>"react"</script></article></body></html>')
+        assert not is_spa(html)
+
+    def test_json_ld_next_key_not_spa(self):
+        html = ('<html><body><div>content ' + "y" * 600 +
+                '</div><script type="application/ld+json">{"next": "/page2"}</script></body></html>')
+        assert not is_spa(html)
+
+    def test_article_mentioning_vite_not_spa(self):
+        html = '<html><body><p>' + "z" * 600 + '</p><p>"vite" is a build tool</p></body></html>'
+        assert not is_spa(html)
+
+    def test_ssr_next_page_with_content_not_spa(self):
+        html = ('<html><body><div id="__next">' + ("<p>Server rendered content.</p>" * 20) +
+                '</div><script id="__NEXT_DATA__">{}</script></body></html>')
+        assert not is_spa(html)
+
+    def test_next_shell_with_no_content_is_spa(self):
+        html = '<html><body><div id="__next"></div><script id="__NEXT_DATA__">{}</script></body></html>'
+        assert is_spa(html)
+
+    def test_spinner_only_root_is_spa(self):
+        html = '<html><body><div id="root"><!-- comment --></div></body></html>'
+        assert is_spa(html)
+
+
 
 class TestSelect:
     def test_css_selector(self):
@@ -63,6 +92,32 @@ class TestSelectXpath:
         soup = parse("<html><body><h1>A</h1><h1>B</h1></body></html>")
         results = select_xpath(soup, "//h1")
         assert len(results) == 2
+        assert [t.get_text() for t in results] == ["A", "B"]
+
+    def test_xpath_returns_correct_element_not_first(self):
+        html = ('<html><body><div class="a"><h1>First</h1></div>'
+                '<div class="b"><h1>Second</h1></div></body></html>')
+        soup = parse(html)
+        results = select_xpath(soup, "//div[@class='b']//h1")
+        assert len(results) == 1
+        assert results[0].get_text() == "Second"
+
+    def test_xpath_preserves_attributes(self):
+        soup = parse('<html><body><a href="/x" class="link">L</a></body></html>')
+        results = select_xpath(soup, "//a")
+        assert results[0].get("href") == "/x"
+        assert "link" in results[0].get("class")
+
+    def test_xpath_no_duplicates(self):
+        html = '<html><body><h1>A</h1><h1>B</h1><h1>C</h1></body></html>'
+        soup = parse(html)
+        results = select_xpath(soup, "//h1")
+        assert len(results) == len(set(t.get_text() for t in results))
+
+    def test_xpath_invalid_expression_raises(self):
+        soup = parse("<html><body><h1>A</h1></body></html>")
+        with pytest.raises(SelectorError):
+            select_xpath(soup, "//h1[")
 
     def test_xpath_no_match_raises(self):
         soup = parse("<html><body><h1>A</h1></body></html>")
@@ -142,6 +197,25 @@ class TestExtractFields:
         div = soup.find("div")
         fields = extract_fields(div, content="span.x.text")
         assert fields["content"] == "Hello"
+
+    def test_class_selector_defaults_to_text(self):
+        soup = parse('<div class="product"><span class="price">$9.99</span></div>')
+        div = soup.find("div")
+        fields = extract_fields(div, price="span.price")
+        assert fields["price"] == "$9.99"
+
+    def test_descendant_selector_without_explicit_prop(self):
+        soup = parse('<div class="product"><h2>Widget</h2></div>')
+        div = soup.find("div")
+        fields = extract_fields(div, name=".product h2")
+        assert fields["name"] == "Widget"
+
+    def test_attribute_any_name_via_at(self):
+        soup = parse('<div><a href="/p" data-id="7">Link</a></div>')
+        div = soup.find("div")
+        fields = extract_fields(div, ident="a@data-id", link="a@href")
+        assert fields["ident"] == "7"
+        assert fields["link"] == "/p"
 
 
 class TestExtractTable:

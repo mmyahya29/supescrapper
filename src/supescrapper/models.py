@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import csv
-import io
 import json
-import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +24,14 @@ class ScrapedItem:
         return self.meta.get(key, self.attrs.get(key))
 
     def to_dict(self) -> dict[str, Any]:
-        d = {"tag": self.tag, "text": self.text, "url": self.url}
+        # Attributes and meta cannot overwrite core fields (tag/text/url
+        # would otherwise be spoofable by e.g. <div text="...">).
+        d: dict[str, Any] = {}
         d.update(self.attrs)
         d.update(self.meta)
+        d["tag"] = self.tag
+        d["text"] = self.text
+        d["url"] = self.url
         if self.classification:
             d["classification"] = self.classification
         return d

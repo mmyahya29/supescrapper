@@ -7,34 +7,32 @@ Requires optional dependencies:
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from .classifier import ClassificationRule, ElementClassifier, get_classifier
-from .exceptions import SelectorError, FetchError, DynamicPageError
-from .parser import (
-    parse, is_spa, select, select_xpath, select_by_regex, search_text,
-    tags_to_items, extract_fields, extract_table, extract_links, extract_images,
-)
-from .models import ScrapedItem, ScrapedResultSet
-from .query import QueryChain
+from .engine import ScrapeEngine
+from .exceptions import DynamicPageError, FetchError
+from .parser import is_spa
+
+_log = logging.getLogger("supescrapper")
 
 
-class AsyncScraper:
+class AsyncScraper(ScrapeEngine):
     """
     Async entry point — fluent API for web scraping with async/await.
 
     Usage:
         async def main():
-            results = await AsyncScraper().fetch("https://example.com").query("h1").extract()
+            async with AsyncScraper() as scraper:
+                await scraper.fetch("https://example.com")
+                results = scraper.query("h1").extract()
     """
 
-    def __init__(self) -> None:
-        self._html: str = ""
-        self._soup = None
-        self._results: ScrapedResultSet | None = None
-        self._url: str = ""
-        self._query_chain: QueryChain | None = None
-        self._classifier: ElementClassifier = get_classifier()
+    async def __aenter__(self) -> "AsyncScraper":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
 
     async def fetch(
         self,
@@ -47,27 +45,74 @@ class AsyncScraper:
         proxies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
-        wait_until: str = "networkidle",
+        wait_until: str = "domcontentloaded",
         viewport: dict[str, int] | None = None,
+        scroll: int = 0,
+        wait_for: str | None = None,
+        wait_ms: int | None = None,
+        impersonate: str | bool | None = None,
+        proxy_pool: list[str] | None = None,
+        proxy_strategy: str = "round_robin",
     ) -> "AsyncScraper":
-        """Fetch a URL asynchronously. Auto-detects SPAs."""
-        self._url = url
+        """Fetch a URL asynchronously. Auto-detects SPAs. Supports impersonation."""
+        use_impersonate = bool(impersonate)
 
-        if dynamic is True:
-            self._html = await self._fetch_dynamic(url, timeout=timeout, user_agent=user_agent, viewport=viewport, wait_until=wait_until)
+        if use_impersonate:
+            html = await self._fetch_impersonate(
+                url, impersonate=impersonate, timeout=timeout, retries=retries,
+                headers=headers, cookies=cookies, proxies=proxies,
+                proxy_pool=proxy_pool, proxy_strategy=proxy_strategy,
+            )
+            if is_spa(html) and dynamic is not False:
+                _log.info("SPA detected — switching to Playwright for %s", url)
+                html = await self._fetch_dynamic(
+                    url, timeout=timeout, user_agent=user_agent, viewport=viewport,
+                    wait_until=wait_until, scroll=scroll, wait_for=wait_for, wait_ms=wait_ms,
+                )
+        elif dynamic is True:
+            html = await self._fetch_dynamic(
+                url, timeout=timeout, user_agent=user_agent, viewport=viewport,
+                wait_until=wait_until, scroll=scroll, wait_for=wait_for, wait_ms=wait_ms,
+            )
         elif dynamic is False:
-            self._html = await self._fetch_static(url, timeout=timeout, retries=retries, headers=headers, cookies=cookies, proxies=proxies, user_agent=user_agent)
+            html = await self._fetch_static(
+                url, timeout=timeout, retries=retries, headers=headers,
+                cookies=cookies, proxies=proxies, user_agent=user_agent,
+            )
         else:
-            self._html = await self._fetch_static(url, timeout=timeout, retries=retries, headers=headers, cookies=cookies, proxies=proxies, user_agent=user_agent)
-            if is_spa(self._html):
-                import sys
-                print("[supescrapper] SPA detected — switching to Playwright...", file=sys.stdout)
-                self._html = await self._fetch_dynamic(url, timeout=timeout, user_agent=user_agent, viewport=viewport, wait_until=wait_until)
+            html = await self._fetch_static(
+                url, timeout=timeout, retries=retries, headers=headers,
+                cookies=cookies, proxies=proxies, user_agent=user_agent,
+            )
+            if is_spa(html):
+                _log.info("SPA detected — switching to Playwright for %s", url)
+                html = await self._fetch_dynamic(
+                    url, timeout=timeout, user_agent=user_agent, viewport=viewport,
+                    wait_until=wait_until, scroll=scroll, wait_for=wait_for, wait_ms=wait_ms,
+                )
 
-        self._soup = parse(self._html)
-        self._results = None
-        self._query_chain = None
+        self._load_html(html, url=url)
         return self
+
+    async def _fetch_impersonate(self, url: str, *, impersonate: str | bool, timeout: int,
+                                 retries: int, headers: dict[str, str] | None,
+                                 cookies: dict[str, str] | None,
+                                 proxies: dict[str, str] | None, proxy_pool: list[str] | None,
+                                 proxy_strategy: str) -> str:
+        from .impersonate import AsyncImpersonatingFetcher, DEFAULT_IMPERSONATE
+
+        target = DEFAULT_IMPERSONATE if impersonate is True else impersonate
+        pool = list(proxy_pool or [])
+        if not pool and proxies:
+            single = proxies.get("https") or proxies.get("http")
+            if single:
+                pool = [single]
+
+        fetcher = AsyncImpersonatingFetcher(
+            impersonate=target, proxies=pool, proxy_strategy=proxy_strategy,
+            timeout=timeout, retries=retries, headers=headers,
+        )
+        return await fetcher.fetch(url, cookies=cookies)
 
     async def _fetch_static(
         self,
@@ -85,7 +130,8 @@ class AsyncScraper:
         except ImportError:
             raise FetchError("httpx is required for AsyncScraper. Install: pip install httpx")
 
-        from .fetcher import _USER_AGENT
+        from .fetcher import _normalize_url, _USER_AGENT
+        url = _normalize_url(url)
         ua = user_agent or _USER_AGENT
         default_headers = {"User-Agent": ua}
         if headers:
@@ -120,7 +166,10 @@ class AsyncScraper:
         timeout: int = 30,
         user_agent: str | None = None,
         viewport: dict[str, int] | None = None,
-        wait_until: str = "networkidle",
+        wait_until: str = "domcontentloaded",
+        scroll: int = 0,
+        wait_for: str | None = None,
+        wait_ms: int | None = None,
     ) -> str:
         try:
             from playwright.async_api import async_playwright
@@ -130,216 +179,33 @@ class AsyncScraper:
                 "Install: pip install supescrapper[dynamic] && playwright install"
             )
 
-        from .fetcher import _USER_AGENT
+        from .fetcher import _normalize_url, _USER_AGENT
+        url = _normalize_url(url)
         ua = user_agent or _USER_AGENT
         vp = viewport or {"width": 1920, "height": 1080}
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
-            ctx = await browser.new_context(user_agent=ua, viewport=vp)
-            page = await ctx.new_page()
             try:
-                await page.goto(url, wait_until=wait_until, timeout=timeout * 1000)
-            except Exception as exc:
+                ctx = await browser.new_context(user_agent=ua, viewport=vp)
+                page = await ctx.new_page()
+                try:
+                    await page.goto(url, wait_until=wait_until, timeout=timeout * 1000)
+                    if wait_for:
+                        await page.wait_for_selector(wait_for, timeout=timeout * 1000)
+                    if wait_ms:
+                        await page.wait_for_timeout(wait_ms)
+                    for _ in range(max(0, scroll)):
+                        await page.mouse.wheel(0, 1000)
+                        await page.wait_for_timeout(1000)
+                except Exception as exc:
+                    raise FetchError(f"Failed to load {url} with Playwright: {exc}") from exc
+                return await page.content()
+            finally:
                 await browser.close()
-                raise FetchError(f"Failed to load {url} with Playwright: {exc}") from exc
-            html = await page.content()
-            await browser.close()
-        return html
 
-    def from_html(self, html: str) -> "AsyncScraper":
-        self._html = html
-        self._soup = parse(html)
-        self._results = None
-        self._query_chain = None
-        self._url = ""
-        return self
-
-    def query(self, selector: str, *, mode: str = "css") -> "AsyncScraper":
-        if self._soup is None:
-            raise SelectorError("Nothing to query — call fetch() or from_html() first.")
-        dispatch = {
-            "css": lambda: select(self._soup, selector),
-            "xpath": lambda: select_xpath(self._soup, selector),
-            "regex": lambda: select_by_regex(self._soup, selector),
-        }
-        fn = dispatch.get(mode)
-        if fn is None:
-            raise ValueError(f"Unknown query mode '{mode}'. Choose from: {list(dispatch)}")
-        tags = fn()
-        self._results = ScrapedResultSet(tags_to_items(tags, base_url=self._url))
-        self._results.source_url = self._url
-        self._query_chain = QueryChain(self._results)
-        return self
-
-    def search(self, term: str, *, case_sensitive: bool = False) -> "AsyncScraper":
-        if self._soup is None:
-            raise SelectorError("Nothing to search — call fetch() or from_html() first.")
-        items = search_text(self._soup, term, case_sensitive=case_sensitive)
-        self._results = ScrapedResultSet(items)
-        self._results.source_url = self._url
-        self._query_chain = QueryChain(self._results)
-        return self
-
-    def where_text(self, op: str, value: str) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._query_chain.where_text(op, value)
-        return self
-
-    def where_attr(self, attr: str, op: str, value: str) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._query_chain.where_attr(attr, op, value)
-        return self
-
-    def where_tag(self, tag_name: str) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._query_chain.where_tag(tag_name)
-        return self
-
-    def where_url(self, op: str, value: str) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._query_chain.where_url(op, value)
-        return self
-
-    def where(self, predicate) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._query_chain.where(predicate)
-        return self
-
-    def limit(self, n: int) -> "AsyncScraper":
-        if self._query_chain is None:
-            raise SelectorError("No active query — call .query() first.")
-        self._results = self._query_chain.limit(n)
-        self._query_chain = QueryChain(self._results)
-        return self
-
-    def extract(self, **field_selectors: str) -> ScrapedResultSet:
-        self._finalize()
-        if not field_selectors:
-            return self._results
-
-        items: list[ScrapedItem] = []
-        for src_item in self._results:
-            inner = parse(src_item.html)
-            tag = inner.find()
-            if tag is None:
-                continue
-            fields = extract_fields(tag, **field_selectors)
-            merged_attrs = dict(src_item.attrs)
-            item_text = fields.pop("text", src_item.text) if "text" in field_selectors else src_item.text
-            items.append(ScrapedItem(
-                tag=src_item.tag,
-                text=item_text,
-                html=src_item.html,
-                attrs=merged_attrs,
-                url=src_item.url,
-                meta=fields,
-            ))
-        out = ScrapedResultSet(items)
-        out.source_url = self._results.source_url
-        self._results = out
-        return self._results
-
-    def classify(self) -> "AsyncScraper":
-        self._finalize()
-        if self._soup is None or self._results is None:
-            raise SelectorError("Nothing to classify — call fetch() and query() first.")
-        soup = self._soup
-        classified_items: list[ScrapedItem] = []
-        for item in self._results:
-            inner = parse(item.html)
-            tag = inner.find()
-            if tag is None:
-                classified_items.append(item)
-                continue
-            types = self._classifier.classify(tag, soup)
-            new_item = ScrapedItem(
-                tag=item.tag,
-                text=item.text,
-                html=item.html,
-                attrs=dict(item.attrs),
-                url=item.url,
-                meta=dict(item.meta),
-                classification=types,
-            )
-            classified_items.append(new_item)
-        out = ScrapedResultSet(classified_items)
-        out.source_url = self._results.source_url
-        self._results = out
-        self._query_chain = QueryChain(self._results)
-        return self
-
-    def find_elements(self, element_type: str) -> ScrapedResultSet:
-        if self._soup is None:
-            raise SelectorError("Nothing to find — call fetch() or from_html() first.")
-        tags = self._classifier.find(element_type, self._soup)
-        items = tags_to_items(tags, base_url=self._url)
-        for item in items:
-            inner = parse(item.html)
-            tag = inner.find()
-            if tag is not None:
-                item.classification = self._classifier.classify(tag, self._soup)
-        out = ScrapedResultSet(items)
-        out.source_url = self._url
-        self._results = out
-        self._query_chain = QueryChain(self._results)
-        return out
-
-    def find_interactive(self) -> ScrapedResultSet:
-        if self._soup is None:
-            raise SelectorError("Nothing to find — call fetch() or from_html() first.")
-        tags = self._classifier.find_interactive(self._soup)
-        items = tags_to_items(tags, base_url=self._url)
-        for item in items:
-            inner = parse(item.html)
-            tag = inner.find()
-            if tag is not None:
-                item.classification = self._classifier.classify(tag, self._soup)
-        out = ScrapedResultSet(items)
-        out.source_url = self._url
-        self._results = out
-        self._query_chain = QueryChain(self._results)
-        return out
-
-    def extract_table(self, table_selector: str = "table") -> list[dict[str, str]]:
-        self._finalize()
-        if self._soup is None:
-            raise SelectorError("Nothing parsed — call fetch() first.")
-        return extract_table(self._soup, table_selector)
-
-    def extract_links(self, selector: str = "a[href]") -> ScrapedResultSet:
-        self._finalize()
-        if self._soup is None:
-            raise SelectorError("Nothing parsed — call fetch() first.")
-        items = extract_links(self._soup, selector)
-        out = ScrapedResultSet(items)
-        out.source_url = self._url
-        return out
-
-    def extract_images(self, selector: str = "img[src]") -> ScrapedResultSet:
-        self._finalize()
-        if self._soup is None:
-            raise SelectorError("Nothing parsed — call fetch() first.")
-        items = extract_images(self._soup, selector)
-        out = ScrapedResultSet(items)
-        out.source_url = self._url
-        return out
-
-    def _finalize(self) -> None:
-        if self._query_chain is not None and self._results is not None:
-            self._results = self._query_chain.build()
-            self._query_chain = None
-
-    @property
-    def html(self) -> str:
-        return self._html
-
-    @property
-    def results(self) -> ScrapedResultSet | None:
-        self._finalize()
-        return self._results
+    @staticmethod
+    async def scrape_feeds(*args: Any, **kwargs: Any):
+        """Asynchronously scrape multiple RSS / Atom feeds simultaneously."""
+        from .feeds import async_scrape_feeds
+        return await async_scrape_feeds(*args, **kwargs)

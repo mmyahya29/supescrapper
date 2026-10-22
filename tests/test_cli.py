@@ -102,3 +102,104 @@ class TestMain:
                 main(["https://example.com", "--select", "div", "--classify"])
 
             mock_scraper.classify.assert_called_once()
+
+
+class TestCliIntegration:
+    """End-to-end CLI runs against a local HTML file (real Scraper)."""
+
+    def _html_file(self, tmp_path):
+        p = tmp_path / "page.html"
+        p.write_text(
+            '<html><body>'
+            '<button>OK</button><button>Cancel</button>'
+            '<a href="/blog">Blog</a>'
+            '</body></html>',
+            encoding="utf-8",
+        )
+        return str(p)
+
+    def test_find_does_not_crash(self, tmp_path):
+        with patch("supescrapper.cli.Console") as mock_console_cls:
+            mock_console = MagicMock()
+            mock_console_cls.return_value = mock_console
+            main(["--html-file", self._html_file(tmp_path), "--find", "button"])
+            mock_console.print.assert_called()
+
+    def test_find_with_filter(self, tmp_path):
+        with patch("supescrapper.cli.Console") as mock_console_cls:
+            mock_console = MagicMock()
+            mock_console_cls.return_value = mock_console
+            main([
+                "--html-file", self._html_file(tmp_path),
+                "--find", "button",
+                "--where-text", "contains", "OK",
+            ])
+            printed = " ".join(str(c) for c in mock_console.print.call_args_list)
+            assert "1 results found" in printed
+
+    def test_selector_error_is_handled(self, tmp_path):
+        with patch("supescrapper.cli.Console") as mock_console_cls:
+            mock_console = MagicMock()
+            mock_console_cls.return_value = mock_console
+            with pytest.raises(SystemExit) as exc:
+                main(["--html-file", self._html_file(tmp_path), "--select", "nonexistent-tag"])
+            assert exc.value.code == 1
+
+    def test_xpath_selection(self, tmp_path):
+        with patch("supescrapper.cli.Console") as mock_console_cls:
+            mock_console = MagicMock()
+            mock_console_cls.return_value = mock_console
+            main(["--html-file", self._html_file(tmp_path), "--select-xpath", "//button"])
+            printed = " ".join(str(c) for c in mock_console.print.call_args_list)
+            assert "2 results found" in printed
+
+
+class TestCliCrawl:
+    def test_crawl_requires_url(self):
+        with patch("supescrapper.cli.Console"):
+            with pytest.raises(SystemExit):
+                main(["--crawl"])
+
+    def test_crawl_runs_with_injected_fetch(self, tmp_path):
+        site = {
+            "https://s.test/": '<html><body><a href="/a">A</a></body></html>',
+            "https://s.test/a": '<html><body><p>leaf</p></body></html>',
+        }
+
+        def fake_fetch(url, config):
+            return site[url]
+
+        with patch("supescrapper.crawler._default_fetch", fake_fetch):
+            with patch("supescrapper.cli.Console") as mock_console_cls:
+                mock_console = MagicMock()
+                mock_console_cls.return_value = mock_console
+                main(["https://s.test/", "--crawl", "--select", "a", "--max-urls", "5"])
+                printed = " ".join(str(c) for c in mock_console.print.call_args_list)
+                assert "Crawled" in printed
+
+    def test_crawl_export(self, tmp_path):
+        site = {"https://s.test/": '<html><body><a href="/a">A</a></body></html>'}
+        out = tmp_path / "crawl.json"
+
+        def fake_fetch(url, config):
+            return site.get(url, "<p>x</p>")
+
+        with patch("supescrapper.crawler._default_fetch", fake_fetch):
+            with patch("supescrapper.cli.Console"):
+                main(["https://s.test/", "--crawl", "--select", "a",
+                      "--export", "json", "-o", str(out)])
+        assert out.exists()
+
+
+class TestCliFeeds:
+    def test_feeds_calls_scrape_feeds(self):
+        with patch("supescrapper.feeds.scrape_feeds") as mock_sf:
+            from supescrapper.schema import SchemaResultSet
+            mock_sf.return_value = SchemaResultSet([])
+            with patch("supescrapper.cli.Console"):
+                main(["--feeds", "https://a.test/rss", "https://b.test/atom", "--schema", "rss"])
+            mock_sf.assert_called_once()
+            call_args = mock_sf.call_args
+            assert call_args[0][0] == ["https://a.test/rss", "https://b.test/atom"]
+            assert call_args[1]["schema"] == "rss"
+

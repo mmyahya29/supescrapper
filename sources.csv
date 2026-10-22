@@ -1,0 +1,11 @@
+Source Name,Website URL,Main RSS Feed URL,Schema
+Bloomberg,bloomberg.com,https://www.bloomberg.com/feeds/markets/news.rss,bloomberg
+Al Jazeera,aljazeera.com,https://news.google.com/rss/search?q=site:aljazeera.com+when:7d&hl=en-US&gl=US&ceid=US:en,rss
+BBC News,bbc.com/news,http://feeds.bbci.co.uk/news/rss.xml,rss
+CNN,cnn.com,http://rss.cnn.com/rss/edition.rss,rss
+The Guardian,theguardian.com,https://www.theguardian.com/international/rss,rss
+The Wall Street Journal,wsj.com,https://feeds.a.dj.com/rss/RSSWorldNews.xml,rss
+Reuters,reuters.com,https://news.google.com/rss/search?q=site:reuters.com+when:7d&hl=en-US&gl=US&ceid=US:en,rss
+CNBC,cnbc.com,https://www.cnbc.com/id/100003114/device/rss/rss.html,rss
+The New York Times,nytimes.com,https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml,rss
+NPR,npr.org,https://feeds.npr.org/1001/rss.xml,rss

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
-from urllib.parse import urlparse
+import re
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -15,16 +14,21 @@ _USER_AGENT = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
 
 def _normalize_url(url: str) -> str:
-    """Normalize URL by adding https:// if no scheme is present."""
+    """Normalize URL by adding https:// if no scheme:// is present."""
     url = url.strip()
     if not url:
         return url
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        url = "https://" + url
-    return url
+    if _SCHEME_RE.match(url):
+        return url
+    if url.startswith("//"):
+        # protocol-relative URL
+        return "https:" + url
+    # Scheme-less (e.g. "example.com", "example.com:8080/path")
+    return "https://" + url
 
 
 def _build_session(
@@ -54,10 +58,13 @@ def fetch_static(
     proxies: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
     cookies: dict[str, str] | None = None,
+    session: requests.Session | None = None,
 ) -> str:
     """Fetch *url* with requests and return raw HTML."""
     url = _normalize_url(url)
-    session = _build_session(timeout=timeout, retries=retries, user_agent=user_agent, proxies=proxies)
+    owns_session = session is None
+    if session is None:
+        session = _build_session(timeout=timeout, retries=retries, user_agent=user_agent, proxies=proxies)
     if headers:
         session.headers.update(headers)
     try:
@@ -65,6 +72,9 @@ def fetch_static(
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise FetchError(f"Failed to fetch {url}: {exc}") from exc
+    finally:
+        if owns_session:
+            session.close()
     return resp.text
 
 
@@ -75,8 +85,18 @@ def fetch_dynamic(
     wait_until: str = "domcontentloaded",
     user_agent: str = _USER_AGENT,
     viewport: dict[str, int] | None = None,
+    scroll: int = 0,
+    scroll_delay_ms: int = 1000,
+    wait_for: str | None = None,
+    wait_ms: int | None = None,
 ) -> str:
-    """Fetch *url* with Playwright (headless Chromium) and return rendered HTML."""
+    """Fetch *url* with Playwright (headless Chromium) and return rendered HTML.
+
+    scroll:        number of times to wheel-scroll down (triggers lazy loading)
+    scroll_delay_ms: settle delay after each scroll step
+    wait_for:      optional CSS selector to wait for before capturing HTML
+    wait_ms:       optional fixed wait (ms) after navigation
+    """
     url = _normalize_url(url)
     try:
         from playwright.sync_api import sync_playwright
@@ -88,15 +108,23 @@ def fetch_dynamic(
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent=user_agent,
-            viewport=viewport or {"width": 1920, "height": 1080},
-        )
-        page = ctx.new_page()
         try:
-            page.goto(url, wait_until=wait_until, timeout=timeout)
-        except Exception as exc:
-            raise FetchError(f"Failed to load {url} with Playwright: {exc}") from exc
-        html = page.content()
-        browser.close()
-    return html
+            ctx = browser.new_context(
+                user_agent=user_agent,
+                viewport=viewport or {"width": 1920, "height": 1080},
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until=wait_until, timeout=timeout)
+                if wait_for:
+                    page.wait_for_selector(wait_for, timeout=timeout)
+                if wait_ms:
+                    page.wait_for_timeout(wait_ms)
+                for _ in range(max(0, scroll)):
+                    page.mouse.wheel(0, 1000)
+                    page.wait_for_timeout(scroll_delay_ms)
+            except Exception as exc:
+                raise FetchError(f"Failed to load {url} with Playwright: {exc}") from exc
+            return page.content()
+        finally:
+            browser.close()

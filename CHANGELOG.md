@@ -38,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Options: `--target N` (default 20), `--max-pages N` (default 5),
   `--no-ldjson`. Works with `--export csv|xlsx|json|sqlite`, `--output`,
   `--table`.
+- **Large-scale news crawl mode** (`--news --crawl`, `supescrapper.news_crawler`):
+  multi-source crawler aimed at 100k+ unique articles. Works with a single
+  positional URL (`--news --crawl https://bbc.com/news`) or `--sources` lists.
+  Seed ladder per source: RSS → sitemaps (robots.txt discovery + recursive,
+  `.gz`-compressed supported) → BFS link crawling → Google News RSS fallback.
+  `--target N` is the crawl goal: per-source caps default to the target split
+  across sources, so discovery rounds scale up (sitemap/BFS engage when RSS
+  alone can't fill the target). Threaded per-source workers with per-host
+  politeness, incremental checkpointing (`--checkpoint`/`--resume`, CSV append),
+  and global + cross-host path dedup (www./.com/.co.uk twins of one article
+  collapse to a single record). Seeds are filtered to the source's host family
+  (registrable domain, e.g. `bbc.com` ≡ `bbc.co.uk`) so syndicated or unrelated
+  articles that feeds and Google News queries return never leak into a
+  source's records.
 - **XLSX export**: `--export xlsx` (or `xls`) writes `.xlsx` files via
   `openpyxl`; new `export_xlsx()` and `export_records()` in `supescrapper.exporters`.
 - **Per-site schema configs** (`examples/site_configs/`): JSON schema
@@ -56,6 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ScrapedResultSet.export()` / exporters also accept plain dict record lists.
 - `--export` choices expanded: `json`, `csv`, `sqlite`, `xlsx`, `xls`.
+
+### Fixed
+
+- `--news` mode article fetches now share one keep-alive HTTP session with a
+  small per-request delay, and the seed URL is resolved to the site's canonical
+  host before scanning (e.g. `bbc.com` -> `www.bbc.com` redirects no longer add
+  a round-trip to every article fetch). Failed article pages are reported on
+  the console instead of being silently dropped.
+- News crawl: Google News redirect resolver only followed http/https absolute
+  URLs (relative redirects crashed resolution); URL dedup keys now strip `www.`
+  so host aliases count as one article; `.gz` sitemaps are fetched and
+  decompressed instead of skipped.
 
 
 Hardening release: correctness fixes for Levels 1–2, shared sync/async core,

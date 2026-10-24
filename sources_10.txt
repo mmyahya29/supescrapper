@@ -1,0 +1,11 @@
+BBC,https://bbc.com/news,https://feeds.bbci.co.uk/news/rss.xml
+CNN,https://cnn.com,http://rss.cnn.com/rss/edition.rss
+Reuters,https://reuters.com,
+The Guardian,https://www.theguardian.com/international/rss,https://www.theguardian.com/international/rss
+Al Jazeera,https://www.aljazeera.com,
+NPR,https://www.npr.org,https://feeds.npr.org/1001/rss.xml
+NYTimes,https://www.nytimes.com,https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+WSJ,https://www.wsj.com,https://feeds.a.dj.com/rss/RSSWorldNews.xml
+CNBC,https://www.cnbc.com,https://www.cnbc.com/id/100003114/device/rss/rss.html
+Google News Al Jazeera,https://www.aljazeera.com,https://news.google.com/rss/search?q=site:aljazeera.com+when:7d&hl=en-US&gl=US&ceid=US:en
+Google News Reuters,https://reuters.com,https://news.google.com/rss/search?q=site:reuters.com+when:7d&hl=en-US&gl=US&ceid=US:en

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -95,9 +96,31 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- News Articles from Website ---
     news_grp = p.add_argument_group("news articles")
     news_grp.add_argument("--news", action="store_true", help="Extract news articles from a website (ld+json + RSS fallback)")
-    news_grp.add_argument("--target", type=int, default=20, help="Target number of articles to collect (default: 20)")
+    news_grp.add_argument("--target", type=int, help="Target articles for --news (default: 20); crawl goal for --news --crawl")
     news_grp.add_argument("--max-pages", type=int, default=5, help="Max section pages to scan for article links (default: 5)")
     news_grp.add_argument("--no-ldjson", action="store_true", help="Skip ld+json extraction, use CSS only")
+
+    # --- News Crawling (large scale, requires --crawl) ---
+    news_grp.add_argument("--sources", nargs="+", metavar="URL", help="Source URLs to crawl (defaults to the positional URL when omitted)")
+    news_grp.add_argument("--max-articles", type=int, help="Global article cap across all sources (default: --target or 100000)")
+    news_grp.add_argument("--max-articles-per-source", type=int, help="Max articles per source (default: 1000, or --target split across sources)")
+    news_grp.add_argument("--crawl-concurrency", type=int, default=20, help="Max concurrent source workers (default: 20)")
+    news_grp.add_argument("--article-concurrency", type=int, default=16, help="Concurrent article fetches per source (default: 16)")
+    news_grp.add_argument("--crawl-depth", type=int, default=3, help="Max crawl depth per source (default: 3)")
+    news_grp.add_argument("--crawl-delay", type=float, default=1.0, help="Delay between requests per host in seconds (default: 1.0)")
+    news_grp.add_argument("--checkpoint", metavar="PATH", help="Checkpoint file path for resume (default: .news_checkpoint.json)")
+    news_grp.add_argument("--checkpoint-interval", type=int, default=25, help="Save checkpoint every N articles (default: 25)")
+    news_grp.add_argument("--resume", action="store_true", help="Resume from checkpoint file")
+    news_grp.add_argument("--proxy-strategy", choices=["round_robin", "random"], default="round_robin", help="Proxy rotation strategy (default: round_robin)")
+
+    # --- Playwright / Anti-Bot ---
+    news_grp.add_argument("--playwright-headless", action="store_true", default=True, help="Run Playwright headless (default: True)")
+    news_grp.add_argument("--playwright-headed", action="store_false", dest="playwright_headless", help="Run Playwright headed (for manual CAPTCHA solving)")
+    news_grp.add_argument("--playwright-stealth", action="store_true", default=True, help="Enable playwright-stealth anti-detection (default: True)")
+    news_grp.add_argument("--no-playwright-stealth", action="store_false", dest="playwright_stealth", help="Disable playwright-stealth")
+    news_grp.add_argument("--playwright-persistent", action="store_true", help="Reuse browser context for cookies/session persistence")
+    news_grp.add_argument("--playwright-context-storage", metavar="PATH", help="Path to store/load browser context (cookies, localStorage)")
+    news_grp.add_argument("--captcha-timeout", type=int, default=300, help="CAPTCHA wait timeout in seconds (default: 300)")
 
     return p
 
@@ -114,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 s = get_schema(name)
                 console.print(f"  [cyan]{name}[/cyan] — {s.description or 'no description'}")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 console.print(f"  [cyan]{name}[/cyan]")
         return
 
@@ -126,7 +149,7 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"\n[dim]Interactive types: {', '.join(sorted(INTERACTIVE_TYPES))}[/dim]")
         return
 
-    if not args.url and not args.html_file and not args.feeds and not args.feeds_file:
+    if not args.url and not args.html_file and not args.feeds and not args.feeds_file and not (args.news and args.sources):
         parser.print_help()
         sys.exit(1)
 
@@ -175,7 +198,7 @@ def _run(args, console: Console) -> None:
             console.print(table)
         return
 
-    if args.crawl:
+    if args.crawl and not args.news:
         _run_crawl(args, console)
         return
 
@@ -184,7 +207,10 @@ def _run(args, console: Console) -> None:
         return
 
     if args.news:
-        _run_news(args, console)
+        if args.crawl:
+            _run_news_crawl(args, console)
+        else:
+            _run_news(args, console)
         return
 
     scraper = Scraper()
@@ -355,7 +381,7 @@ def _run_feeds(args, console: Console) -> None:
 def _run_news(args, console: Console) -> None:
     """Extract news articles from a website using ld+json with RSS fallback."""
 
-    from .fetcher import fetch_static
+    from .fetcher import _build_session, fetch_static
     from .parser import is_xml, parse
     from .schema import get_schema
 
@@ -363,7 +389,7 @@ def _run_news(args, console: Console) -> None:
         console.print("[red]--news requires a URL.[/red]")
         sys.exit(1)
 
-    target = args.target
+    target = args.target or 20
     max_pages = args.max_pages
     use_ldjson = not args.no_ldjson
 
@@ -374,48 +400,61 @@ def _run_news(args, console: Console) -> None:
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
 
-    rss_urls = _discover_rss_feeds(base_url, console)
-    article_urls: list[str] = []
-    seen_urls: set[str] = set()
-
-    # Step 2: Get article URLs from RSS feeds
-    for rss_url in rss_urls:
-        if len(article_urls) >= target * 2:  # Get extra for filtering
-            break
+    session = _build_session(timeout=args.timeout, retries=args.retries)
+    try:
+        # Resolve redirects once so discovered links use the site's canonical
+        # host — e.g. bbc.com 301s to www.bbc.com, which would otherwise add a
+        # redirect round-trip to every article fetch.
         try:
-            html = fetch_static(rss_url, timeout=args.timeout, retries=args.retries)
-            if is_xml(html):
-                soup = parse(html)
-                # Use rss schema to extract article URLs
-                rss_sch = get_schema("rss")
-                batch = rss_sch.extract(soup, base_url=rss_url)
-                for rec in batch:
-                    url = rec.get("source_urls") or rec.get("url") or rec.get("link")
-                    if url and url not in seen_urls:
-                        seen_urls.add(url)
-                        article_urls.append(url)
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[yellow]Failed to fetch RSS {rss_url}: {exc}[/yellow]")
+            base_url = str(session.get(base_url, timeout=args.timeout).url)
+        except Exception:
+            pass
 
-    # Step 3: If not enough from RSS, scan homepage/section pages for article links
-    if len(article_urls) < target:
-        console.print(f"[yellow]Only {len(article_urls)} articles from RSS, scanning website for more...[/yellow]")
-        article_urls.extend(_scan_for_article_links(base_url, max_pages, target - len(article_urls), args, console, seen_urls))
+        rss_urls = _discover_rss_feeds(base_url, console, session=session)
+        article_urls: list[str] = []
+        seen_urls: set[str] = set()
 
-    if not article_urls:
-        console.print("[red]No article URLs found.[/red]")
-        return
+        # Step 2: Get article URLs from RSS feeds
+        for rss_url in rss_urls:
+            if len(article_urls) >= target * 2:  # Get extra for filtering
+                break
+            try:
+                html = fetch_static(rss_url, timeout=args.timeout, retries=args.retries, session=session)
+                if is_xml(html):
+                    soup = parse(html)
+                    # Use rss schema to extract article URLs
+                    rss_sch = get_schema("rss")
+                    batch = rss_sch.extract(soup, base_url=rss_url)
+                    for rec in batch:
+                        url = rec.get("source_urls") or rec.get("url") or rec.get("link")
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            article_urls.append(url)
+            except Exception as exc:
+                console.print(f"[yellow]Failed to fetch RSS {rss_url}: {exc}[/yellow]")
 
-    console.print(f"[bold cyan]Fetching {min(len(article_urls), target)} article pages...[/bold cyan]")
+        # Step 3: If not enough from RSS, scan homepage/section pages for article links
+        if len(article_urls) < target:
+            console.print(f"[yellow]Only {len(article_urls)} articles from RSS, scanning website for more...[/yellow]")
+            article_urls.extend(_scan_for_article_links(base_url, max_pages, target - len(article_urls), args, console, seen_urls, session=session))
 
-    # Step 4: Fetch each article page and extract using ld+json or CSS
-    records = _fetch_and_extract_articles(
-        article_urls[:target],
-        target,
-        use_ldjson,
-        args,
-        console
-    )
+        if not article_urls:
+            console.print("[red]No article URLs found.[/red]")
+            return
+
+        console.print(f"[bold cyan]Fetching {min(len(article_urls), target)} article pages...[/bold cyan]")
+
+        # Step 4: Fetch each article page and extract using ld+json or CSS
+        records = _fetch_and_extract_articles(
+            article_urls[:target],
+            target,
+            use_ldjson,
+            args,
+            console,
+            session=session,
+        )
+    finally:
+        session.close()
 
     if not records:
         console.print("[yellow]No articles extracted.[/yellow]")
@@ -442,15 +481,106 @@ def _run_news(args, console: Console) -> None:
         _print_table(records, console)
 
 
-def _discover_rss_feeds(base_url: str, console: Console) -> list[str]:
+def _run_news_crawl(args, console: Console) -> None:
+    """Run large-scale news crawling across multiple sources."""
+    from .news_crawler import crawl_news_sources
+    
+    source_urls = [s for s in (args.sources or []) if s]
+    if not source_urls and args.url:
+        source_urls = [args.url]  # --news --crawl <single-url>
+    if not source_urls:
+        console.print("[red]--news --crawl requires a URL or --sources (one or more URLs)[/red]")
+        sys.exit(1)
+    
+    if args.export and not args.output:
+        console.print("[red]--output is required when using --export.[/red]")
+        sys.exit(1)
+    
+    # Parse sources
+    sources = []
+    for src in source_urls:
+        url = src.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        parsed = urlparse(url)
+        name = parsed.netloc.replace("www.", "")
+        sources.append({
+            "name": name,
+            "base_url": url,
+            "allowed_domains": [parsed.netloc],
+        })
+
+    # --target drives the crawl goal; per-source default scales with it
+    max_articles = args.target or args.max_articles or 100_000
+    if args.max_articles_per_source is not None:
+        per_source = args.max_articles_per_source
+    elif args.target:
+        per_source = max(1, (max_articles + len(sources) - 1) // len(sources))
+    else:
+        per_source = 1000
+    
+    checkpoint_path = args.checkpoint or ".news_checkpoint.json"
+    
+    if args.resume and not Path(checkpoint_path).exists():
+        console.print(f"[red]Checkpoint file not found: {checkpoint_path}[/red]")
+        sys.exit(1)
+    
+    console.print(f"[bold cyan]Starting news crawl: {len(sources)} sources, target {max_articles} articles ({per_source}/source)[/bold cyan]")
+    console.print(f"[dim]Checkpoint: {checkpoint_path} (interval: {args.checkpoint_interval})[/dim]")
+    if args.resume:
+        console.print("[yellow]Resuming from checkpoint...[/yellow]")
+    
+    # Run the crawl
+    records = crawl_news_sources(
+        sources=sources,
+        max_articles=max_articles,
+        max_articles_per_source=per_source,
+        max_workers=args.crawl_concurrency,
+        crawl_depth=args.crawl_depth,
+        crawl_delay=args.crawl_delay,
+        checkpoint_path=checkpoint_path,
+        checkpoint_interval=args.checkpoint_interval,
+        proxy_pool=args.proxy_pool,
+        proxy_strategy=args.proxy_strategy,
+        impersonate=args.impersonate,
+        timeout=args.timeout,
+        retries=args.retries,
+        export_format=args.export or "csv",
+        output_path=args.output or "news_articles.csv",
+        console=console,
+        playwright_headless=args.playwright_headless,
+        playwright_fallback=True,
+        playwright_stealth=args.playwright_stealth,
+        playwright_persistent=args.playwright_persistent,
+        playwright_context_storage=args.playwright_context_storage,
+        captcha_timeout_sec=args.captcha_timeout,
+        article_concurrency=args.article_concurrency,
+    )
+    
+    console.print(f"\n[bold green]{len(records)} articles extracted.[/bold green]")
+    
+    # Final output if not already exported
+    if not args.export and records:
+        if args.raw:
+            import json
+            console.print_json(json.dumps(records, indent=2, ensure_ascii=False))
+        else:
+            _print_table(records, console)
+
+
+def _discover_rss_feeds(base_url: str, console: Console, session=None) -> list[str]:
     """Discover RSS feed URLs from a website."""
 
     from .fetcher import fetch_static
+    from .news_crawler import KNOWN_FEEDS
     from .parser import is_xml, parse
 
     rss_urls: list[str] = []
+    # curated cross-domain feeds first (discovery misses these)
+    host = urlparse(base_url).netloc.replace("www.", "").lower()
+    rss_urls.extend(KNOWN_FEEDS.get(host, ()))
     try:
-        html = fetch_static(base_url, timeout=15, retries=2)
+        html = fetch_static(base_url, timeout=15, retries=2, session=session)
         soup = parse(html)
 
         # Look for <link rel="alternate" type="application/rss+xml">
@@ -467,19 +597,19 @@ def _discover_rss_feeds(base_url: str, console: Console) -> list[str]:
             test_url = urljoin(base_url, path)
             if test_url not in rss_urls:
                 try:
-                    test_html = fetch_static(test_url, timeout=10, retries=1)
+                    test_html = fetch_static(test_url, timeout=10, retries=1, session=session)
                     if is_xml(test_html):
                         rss_urls.append(test_url)
-                except Exception:  # noqa: BLE001, S110
+                except Exception:
                     pass
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         console.print(f"[yellow]RSS discovery failed: {exc}[/yellow]")
 
     return rss_urls[:5]  # Limit to 5 feeds
 
 
-def _scan_for_article_links(base_url: str, max_pages: int, needed: int, args, console: Console, seen_urls: set[str]) -> list[str]:
+def _scan_for_article_links(base_url: str, max_pages: int, needed: int, args, console: Console, seen_urls: set[str], session=None) -> list[str]:
     """Scan homepage and section pages for article links."""
     from urllib.parse import urljoin
 
@@ -494,7 +624,7 @@ def _scan_for_article_links(base_url: str, max_pages: int, needed: int, args, co
         if len(article_urls) >= needed:
             break
         try:
-            html = fetch_static(url, timeout=args.timeout, retries=args.retries)
+            html = fetch_static(url, timeout=args.timeout, retries=args.retries, session=session)
             soup = parse(html)
 
             # Common article link patterns
@@ -544,20 +674,30 @@ def _scan_for_article_links(base_url: str, max_pages: int, needed: int, args, co
                 if len(article_urls) >= needed:
                     break
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             console.print(f"[yellow]Failed to scan {url}: {exc}[/yellow]")
 
     return article_urls
 
 
-def _fetch_and_extract_articles(article_urls: list[str], target: int, use_ldjson: bool, args, console: Console) -> list[dict]:
-    """Fetch article pages and extract data using ld+json or CSS fallback."""
+def _fetch_and_extract_articles(article_urls: list[str], target: int, use_ldjson: bool, args, console: Console, session=None, delay: float = 0.25) -> list[dict]:
+    """Fetch article pages and extract data using ld+json or CSS fallback.
+
+    All fetches share one keep-alive session (one TLS handshake per host
+    instead of one per request) with a small delay between requests, and
+    failed pages are reported on the console instead of being dropped
+    silently.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime, timezone
 
-    from .fetcher import fetch_static
+    from .fetcher import _build_session, fetch_static
     from .parser import parse
     from .schema import NEWS_SCHEMA, extract_ld_json
+
+    owns_session = session is None
+    if session is None:
+        session = _build_session(timeout=args.timeout, retries=args.retries)
 
     def _extract_full_text(soup) -> str:
         """Extract full article text content from common article containers."""
@@ -611,9 +751,22 @@ def _fetch_and_extract_articles(article_urls: list[str], target: int, use_ldjson
             return ", ".join(filter(None, names))
         return ""
 
-    def fetch_one(url: str) -> list[dict]:
+    def _short_error(url: str, exc: Exception) -> str:
+        msg = str(exc)
+        prefix = f"Failed to fetch {url}: "
+        if msg.startswith(prefix):
+            msg = msg[len(prefix):]
+        msg = re.sub(r"^HTTPS?ConnectionPool\(host='[^']+', port=\d+\):\s*", "", msg)
+        return f"{type(exc).__name__}: {msg[:110]}"
+
+    def fetch_one(url: str) -> tuple[list[dict], str | None]:
+        if delay:
+            time.sleep(delay)
         try:
-            html = fetch_static(url, timeout=args.timeout, retries=args.retries)
+            html = fetch_static(url, timeout=args.timeout, retries=args.retries, session=session)
+        except Exception as exc:
+            return [], _short_error(url, exc)
+        try:
             soup = parse(html)
             results = []
 
@@ -663,21 +816,41 @@ def _fetch_and_extract_articles(article_urls: list[str], target: int, use_ldjson
                             "scraped_at": datetime.now(timezone.utc).isoformat(),
                             "method": "css",
                         })
-            return results
-        except Exception:  # noqa: BLE001
-            return []
+            return results, None
+        except Exception as exc:
+            return [], _short_error(url, exc)
 
     records: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(fetch_one, u): u for u in article_urls}
-        for fut in as_completed(futures):
-            if len(records) >= target:
-                break
-            res = fut.result()
-            for r in res:
+    failures: list[tuple[str, str]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(fetch_one, u): u for u in article_urls}
+            for fut in as_completed(futures):
+                url = futures[fut]
+                res, err = fut.result()
+                if err is not None:
+                    failures.append((url, err))
+                    continue
+                if not res:
+                    failures.append((url, "no article data (ld+json and CSS fallback both empty)"))
+                    continue
                 if len(records) >= target:
-                    break
-                records.append(r)
+                    continue
+                for r in res:
+                    if len(records) >= target:
+                        break
+                    records.append(r)
+    finally:
+        if owns_session:
+            session.close()
+
+    if failures:
+        console.print(f"[yellow]{len(failures)} of {len(article_urls)} article pages failed:[/yellow]")
+        for url, msg in failures[:10]:
+            console.print(f"  [dim]{url}[/dim]: {msg}")
+        if len(failures) > 10:
+            console.print(f"  [dim]... and {len(failures) - 10} more[/dim]")
+
     return records
 
 
@@ -741,7 +914,7 @@ def _run_crawl(args, console: Console) -> None:
                 return list(sub.extract(**field_selectors))
             if selector:
                 return list(sub.extract())
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
         return []
 

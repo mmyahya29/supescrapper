@@ -44,6 +44,8 @@ from .impersonate import (
     ProxyPool,
 )
 from .models import ScrapedItem, ScrapedResultSet
+from .news_crawler import NewsCrawlEngine, crawl_news_sources
+from .news_crawler import SourceConfig as NewsSourceConfig
 from .query import QueryChain
 from .schema import (
     ARTICLE_SCHEMA,
@@ -99,6 +101,8 @@ __all__ = [
     "Field",
     "ImpersonateNotInstalledError",
     "ImpersonatingFetcher",
+    "NewsCrawlEngine",
+    "NewsSourceConfig",
     "ProxyPool",
     "QueryChain",
     "Schema",
@@ -113,6 +117,7 @@ __all__ = [
     "SupescrapperError",
     "async_scrape_feeds",
     "clean_text",
+    "crawl_news_sources",
     "extract_ld_json",
     "from_ldjson",
     "get_classifier",

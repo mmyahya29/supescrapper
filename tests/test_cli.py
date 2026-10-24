@@ -203,3 +203,45 @@ class TestCliFeeds:
             assert call_args[0][0] == ["https://a.test/rss", "https://b.test/atom"]
             assert call_args[1]["schema"] == "rss"
 
+
+class TestNewsCrawlCli:
+    def test_single_url_crawl_uses_url_as_source(self, tmp_path):
+        fake_records = [{"title": "T", "source_url": "u"}]
+        with patch("supescrapper.news_crawler.crawl_news_sources", return_value=fake_records) as mock_crawl:
+            with patch("supescrapper.cli.Console"):
+                main([
+                    "https://bbc.com/news",
+                    "--news", "--crawl",
+                    "--target", "50",
+                    "--export", "csv",
+                    "-o", str(tmp_path / "out.csv"),
+                    "--checkpoint", str(tmp_path / "ckpt.json"),
+                ])
+        kwargs = mock_crawl.call_args.kwargs
+        assert kwargs["sources"] == [
+            {"name": "bbc.com", "base_url": "https://bbc.com/news", "allowed_domains": ["bbc.com"]}
+        ]
+        assert kwargs["max_articles"] == 50
+        assert kwargs["max_articles_per_source"] == 50
+
+    def test_sources_split_target_across_sources(self, tmp_path):
+        with patch("supescrapper.news_crawler.crawl_news_sources", return_value=[]) as mock_crawl:
+            with patch("supescrapper.cli.Console"):
+                main([
+                    "--news", "--crawl",
+                    "--sources", "https://a.test", "https://b.test",
+                    "--target", "100",
+                    "--export", "csv",
+                    "-o", str(tmp_path / "out.csv"),
+                    "--checkpoint", str(tmp_path / "ckpt.json"),
+                ])
+        kwargs = mock_crawl.call_args.kwargs
+        assert len(kwargs["sources"]) == 2
+        assert kwargs["max_articles"] == 100
+        assert kwargs["max_articles_per_source"] == 50
+
+    def test_crawl_without_url_or_sources_exits(self):
+        with patch("supescrapper.cli.Console"):
+            with pytest.raises(SystemExit):
+                main(["--news", "--crawl"])
+
